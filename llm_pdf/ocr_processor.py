@@ -1,10 +1,12 @@
 """
 Simple OCR processor that reads a PDF file path, converts each page to an image,
-sends them individually to an OpenAI-compatible endpoint (or Azure),
+batches them (max 5 per request), sends them to an OpenAI-compatible endpoint,
 and concatenates the results.
+
 Usage:
     ./ocr_processor.py /path/to/document.pdf
     ./ocr_processor.py document.pdf
+
 Environment variables (from .env file):
     OPENAI_API_KEY - API key for OpenAI or compatible service
     OPENAI_API_BASE - Base URL for the API (default: https://api.openai.com/v1)
@@ -14,6 +16,7 @@ Environment variables (from .env file):
     AZURE_API_KEY - Azure API key (if using Azure)
     AZURE_ENDPOINT - Azure endpoint URL (if using Azure)
     AZURE_DEPLOYMENT - Azure deployment name (if using Azure)
+
 Requirements:
     pip install pymupdf requests python-dotenv
 """
@@ -77,6 +80,7 @@ def convert_pdf_to_base64_images(file_path: str | Path) -> List[str]:
     except Exception as e:
         print(f"Error opening PDF: {e}", file=sys.stderr)
         sys.exit(1)
+    
     page_count = len(doc)
     base64_images = []
     for i in range(page_count):
@@ -90,66 +94,84 @@ def convert_pdf_to_base64_images(file_path: str | Path) -> List[str]:
         # Encode to base64
         b64_str = base64.b64encode(img_data).decode("utf-8")
         base64_images.append(b64_str)
+    
     doc.close()
     print(f"Successfully converted {len(base64_images)} pages.", file=sys.stderr)
     return base64_images
 
-def process_page_openai(
-    page_base64: str,
+def process_batch_openai(
+    page_base64_list: List[str],
     api_key: str,
     api_base: str,
     model: str,
-    max_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None
 ) -> str:
-    """Send a single PDF page (as base64 image) to OpenAI-compatible endpoint."""
+    """
+    Send a batch of PDF pages (as base64 images) to OpenAI-compatible endpoint.
+    Expected list length <= 5.
+    """
     session = create_session()
     endpoint = f"{api_base.rstrip('/')}/chat/completions"
+    
     headers = {
         "Content-Type": "application/json",
     }
     if api_key and api_key.strip():
         headers["Authorization"] = f"Bearer {api_key}"
+
+    # Construct the content array with multiple images followed by a text prompt
+    content_items = []
     
-    prompt = "Transcribe the screenshot of this note. Try to preserve the layout of the page. Format the response in Markdown (e.g., using *bold*, _italics_, `code`, - lists, - [ ] checkboxes and # headings. IMPORTANT: Do not wrap your entire output in a markdown codeblock. Output the raw text directly."
-    
-    # Format: image_url with base64 data
-    content = [
-        {
+    for i, b64_img in enumerate(page_base64_list):
+        content_items.append({
             "type": "image_url",
             "image_url": {
-                "url": f"data:image/png;base64,{page_base64}",
+                "url": f"data:image/png;base64,{b64_img}",
             },
-        },
-        {
-            "type": "text",
-            "text": prompt,
-        },
-    ]
-    
+        })
+
+    # Prompt tailored for multi-page processing
+    prompt = (f"""
+        Transcribe the following screenshot(s) of a document. Try to preserve the layout of each page.
+        Format the response in Markdown (e.g., using **bold**, _italics_, `code`, - lists, - [ ] checkboxes and # headings).
+        IMPORTANT: Do not wrap your entire output in a markdown codeblock. Output the raw text directly.
+        "Process these {len(page_base64_list)} pages in order and always put a Markdown line (---) between each page.
+        """
+    )
+
+    content_items.append({
+        "type": "text",
+        "text": prompt,
+    })
+
     payload = {
         "model": model,
         "messages": [
-            {"role": "user", "content": content}
+            {"role": "user", "content": content_items}
         ],
     }
+    
     if max_tokens:
         payload["max_tokens"] = max_tokens
-    
+
     try:
         response = session.post(endpoint, json=payload, headers=headers, timeout=300)
         response.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        print(f"HTTP Error on page request: {e.response.status_code}", file=sys.stderr)
-        print(f"Response body: {e.response.text[:200]}...", file=sys.stderr) # Limit output for readability
+        print(f"HTTP Error on batch request: {e.response.status_code}", file=sys.stderr)
+        print(f"Response body: {e.response.text[:200]}...", file=sys.stderr)
         raise
-    
+    except Exception as e:
+        print(f"Request failed: {e}", file=sys.stderr)
+        raise
+
     result = response.json()
     if "choices" not in result or len(result["choices"]) == 0:
         print(f"Error: Unexpected response format: {result}", file=sys.stderr)
         raise ValueError("No choices in API response")
     
     choice = result["choices"][0]
-    # Handle different response formats
+    # Handle different response formats (gpt-4o usually returns 'message', legacy might return 'text')
     if "message" in choice:
         extracted_text = choice["message"].get("content", "")
     elif "text" in choice:
@@ -161,7 +183,6 @@ def process_page_openai(
 
 def main(pdf_file_name):
     """Main entry point."""
-    
     load_env()
     pdf_file_path = Path("llm_pdf") / Path("input") / Path(pdf_file_name)
     
@@ -177,16 +198,32 @@ def main(pdf_file_name):
         max_tokens_str = os.getenv("OPENAI_MAX_TOKENS")
         max_tokens_val = int(max_tokens_str) if max_tokens_str else None
         
-        print(f"Processing {len(base64_images_list)} pages via OpenAI...", file=sys.stderr)
+        # Batching configuration
+        batch_size = 5
         
-        for i, img_b64 in enumerate(base64_images_list):
-            print(f"Processing page {i+1}/{len(base64_images_list)}...", file=sys.stderr)
-            text = process_page_openai(
-                img_b64, api_key, api_base, model, max_tokens_val
+        total_pages = len(base64_images_list)
+        num_batches = (total_pages + batch_size - 1) // batch_size
+        
+        print(f"Processing {total_pages} pages in batches of max {batch_size}...", file=sys.stderr)
+
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min(start_idx + batch_size, total_pages)
+            
+            current_batch_images = base64_images_list[start_idx:end_idx]
+            
+            print(f"Processing batch {i+1}/{num_batches} (pages {start_idx+1}-{end_idx})...", file=sys.stderr)
+            
+            text = process_batch_openai(
+                current_batch_images, 
+                api_key, 
+                api_base, 
+                model, 
+                max_tokens_val
             )
             all_texts.append(text)
-        
-        # Concatenate results with newlines between pages
+
+        # Concatenate results with newlines between pages/batches
         final_output = "\n\n---\n\n".join(all_texts)
         
         # Generate output filename: <original_filename_without_extension>.md
@@ -197,7 +234,7 @@ def main(pdf_file_name):
         output_file.write_text(final_output)
         print(f"✓ Output saved to: {output_file.absolute()}", file=sys.stderr)
         print(final_output)
-        
+
     except requests.exceptions.RequestException as e:
         print(f"Error: Request failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -208,6 +245,5 @@ def main(pdf_file_name):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main("test.pdf")
